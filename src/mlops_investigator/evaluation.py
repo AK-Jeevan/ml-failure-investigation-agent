@@ -160,7 +160,7 @@ def _run_functional_cases(path: Path) -> list[dict[str, Any]]:
         required_sources = set(case.get("required_evidence_sources", []))
         remediation = state.remediation or {}
         report_cause = (state.report or {}).get("probable_root_cause")
-        if actual_cause:
+        if actual_cause and cause is not None:
             report_matches_cause = (
                 isinstance(report_cause, dict)
                 and report_cause.get("statement") == state.conclusion
@@ -214,7 +214,7 @@ def _run_functional_cases(path: Path) -> list[dict[str, Any]]:
 
 def _run_compatibility_probes() -> list[dict[str, Any]]:
     checks: dict[str, bool] = {"python_311_or_newer": sys.version_info >= (3, 11)}
-    versions: dict[str, str | None] = {}
+    versions: dict[str, Any] = {}
     for package, minimum in (("fastapi", (0, 115)), ("uvicorn", (0, 34))):
         try:
             version = importlib.metadata.version(package)
@@ -236,7 +236,7 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
             checks["prediction_request_schema_rejects_invalid_payload"] = False
         except ValidationError:
             checks["prediction_request_schema_rejects_invalid_payload"] = True
-        routes = {route.path for route in app.routes}
+        routes = {getattr(route, "path", "") for route in app.routes}
         checks["simulation_api_routes_import"] = {"/health", "/metrics", "/predict", "/evidence/{source}"}.issubset(routes)
     except Exception as exc:
         checks["simulation_api_routes_import"] = False
@@ -311,12 +311,13 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
             from .api import ApprovalRequest, InvestigationRequest
 
             os.environ["API_ACCESS_TOKEN"] = "evaluation-only-token"
-            previous_manager = api_module.manager
+            previous_manager = getattr(api_module, "manager")
             with _temporary_working_directory():
                 try:
-                    api_module.manager = api_module.InvestigationManager(
+                    integration_manager = api_module.InvestigationManager(
                         store=InvestigationStore(Path(temporary_database.name) / "integration.sqlite3")
                     )
+                    setattr(api_module, "manager", integration_manager)
                     background = BackgroundTasks()
                     accepted = api_module.investigate(
                         InvestigationRequest(
@@ -351,7 +352,7 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
                         and approved["remediation"]["approval_status"] == "approved_not_executed"
                     )
                 finally:
-                    api_module.manager = previous_manager
+                    setattr(api_module, "manager", previous_manager)
         except Exception as exc:
             checks["agent_api_end_to_end_workflow"] = False
             versions["agent_api_integration_error"] = f"{type(exc).__name__}: {exc}"
@@ -370,11 +371,11 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
             real_api_request = dashboard_module._api_request
             calls: list[tuple[str, str]] = []
 
-            def fake_api_request(method: str, api_path: str, payload: dict | None = None):
-                calls.append((method, api_path))
-                if method == "POST" and api_path == "/investigate":
+            def fake_api_request(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+                calls.append((method, path))
+                if method == "POST" and path == "/investigate":
                     return {"investigation_id": "evaluation-id", "status": "running"}
-                if api_path.endswith("/status"):
+                if path.endswith("/status"):
                     return {"status": "complete", "updated_at": "evaluation"}
                 if method == "GET":
                     return {
@@ -384,7 +385,7 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
                         "trajectory": [],
                         "report": {},
                     }
-                if api_path.endswith("/cancel"):
+                if path.endswith("/cancel"):
                     return {"status": "cancellation_requested"}
                 return {"status": "ok"}
 
@@ -532,8 +533,8 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
     except OSError:
         checks["request_and_investigation_observability"] = False
 
-    dashboard_module = sys.modules.get(f"{__package__}.dashboard")
-    if dashboard_module is not None:
+    dashboard_runtime = sys.modules.get(f"{__package__}.dashboard")
+    if dashboard_runtime is not None:
         auth_env_names = ("GRADIO_SERVER_NAME", "GRADIO_SERVER_PORT", "GRADIO_AUTH_USERNAME", "GRADIO_AUTH_PASSWORD")
         old_auth_env = {name: os.environ.get(name) for name in auth_env_names}
 
@@ -544,22 +545,22 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
                 self.launch_options = kwargs
 
         launcher = _DashboardLauncher()
-        original_create_dashboard = dashboard_module.create_dashboard
-        original_load_environment = dashboard_module.load_local_environment
+        original_create_dashboard = dashboard_runtime.create_dashboard
+        original_load_environment = dashboard_runtime.load_local_environment
         try:
-            dashboard_module.create_dashboard = lambda: launcher
-            dashboard_module.load_local_environment = lambda: None
+            setattr(dashboard_runtime, "create_dashboard", lambda: launcher)
+            setattr(dashboard_runtime, "load_local_environment", lambda: None)
             os.environ["GRADIO_SERVER_NAME"] = "0.0.0.0"
             os.environ.pop("GRADIO_AUTH_USERNAME", None)
             os.environ.pop("GRADIO_AUTH_PASSWORD", None)
             rejected_unauthenticated = False
             try:
-                dashboard_module.main()
+                dashboard_runtime.main()
             except RuntimeError:
                 rejected_unauthenticated = True
             os.environ["GRADIO_AUTH_USERNAME"] = "evaluation-user"
             os.environ["GRADIO_AUTH_PASSWORD"] = "evaluation-password"
-            dashboard_module.main()
+            dashboard_runtime.main()
             checks["public_dashboard_requires_authentication"] = (
                 rejected_unauthenticated
                 and launcher.launch_options.get("auth") == ("evaluation-user", "evaluation-password")
@@ -568,8 +569,8 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
             checks["public_dashboard_requires_authentication"] = False
             versions["dashboard_auth_probe_error"] = f"{type(exc).__name__}: {exc}"
         finally:
-            dashboard_module.create_dashboard = original_create_dashboard
-            dashboard_module.load_local_environment = original_load_environment
+            setattr(dashboard_runtime, "create_dashboard", original_create_dashboard)
+            setattr(dashboard_runtime, "load_local_environment", original_load_environment)
             for name, value in old_auth_env.items():
                 if value is None:
                     os.environ.pop(name, None)
@@ -705,7 +706,7 @@ def _run_red_team_probes() -> list[dict[str, Any]]:
             except ApprovalError:
                 blocked_before_approval = True
 
-            rejected = {
+            rejected: dict[str, Any] = {
                 "incident": {"scenario": "feature_schema_change"},
                 "remediation": RemediationPlanner().create("feature_change"),
                 "actions_performed": [],
