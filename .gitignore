@@ -6,6 +6,11 @@ venv/
 data/*.sqlite3
 data/simulation_state.json
 .env
+.env.secrets
+*.log
+openapi_tmp*.json
+
+.env
 Agent2/
 .kilo/
 .mypy_cache/
