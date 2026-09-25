@@ -102,6 +102,33 @@ def _base_engine(*, provider=None, tools=None, limits=None) -> InvestigationEngi
     )
 
 
+def _project_artifacts_root() -> Path:
+    """Locate the checkout that holds the Docker, infrastructure, and workflow artifacts.
+
+    The compatibility probes inspect repository files, so the root must resolve both for a
+    source checkout and for an installed package executed from the checkout (for example
+    ``pip install .`` followed by ``mlops-investigate --evaluate``). The ``MLOPS_PROJECT_ROOT``
+    environment variable overrides discovery when the artifacts live elsewhere.
+    """
+    override = os.getenv("MLOPS_PROJECT_ROOT")
+    candidates: list[Path] = [Path(override)] if override else []
+    for base in (Path.cwd(), Path(__file__).resolve().parents[2]):
+        candidates.extend([base, *base.parents])
+    for candidate in candidates:
+        if (candidate / "pyproject.toml").is_file() and (candidate / "Dockerfile").is_file():
+            return candidate
+    return Path(__file__).resolve().parents[2]
+
+
+def _default_evaluation_cases_path() -> Path:
+    """Resolve the golden dataset for both checkout and installed package layouts."""
+    candidates = [
+        base / "data" / "evaluation_cases.json"
+        for base in (Path.cwd(), _project_artifacts_root(), Path(__file__).resolve().parent)
+    ]
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
 def _run_functional_cases(path: Path) -> list[dict[str, Any]]:
     try:
         dataset = json.loads(path.read_text(encoding="utf-8"))
@@ -406,7 +433,7 @@ def _run_compatibility_probes() -> list[dict[str, Any]]:
             sys.modules.pop(api_module_name, None)
         temporary_database.cleanup()
 
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = _project_artifacts_root()
     try:
         dockerfile = (project_root / "Dockerfile").read_text(encoding="utf-8")
         compose = (project_root / "compose.yaml").read_text(encoding="utf-8")
@@ -790,7 +817,7 @@ def _run_red_team_probes() -> list[dict[str, Any]]:
 
 def run_evaluation(cases_path: str | Path | None = None) -> dict[str, Any]:
     """Run deterministic golden cases, red-team probes, and compatibility checks."""
-    path = Path(cases_path) if cases_path else Path(__file__).resolve().parents[2] / "data" / "evaluation_cases.json"
+    path = Path(cases_path) if cases_path else _default_evaluation_cases_path()
     functional = _run_functional_cases(path)
     red_team = _run_red_team_probes()
     compatibility = _run_compatibility_probes()
