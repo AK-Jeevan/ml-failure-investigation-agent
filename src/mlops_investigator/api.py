@@ -6,9 +6,11 @@ import os
 import hmac
 import json
 import logging
+import socket
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
@@ -76,20 +78,31 @@ class ApprovalRequest(BaseModel):
     reason: str = Field(min_length=5, max_length=1_000)
 
 
+# A running investigation is treated as abandoned once its owning API process stops refreshing the
+# liveness heartbeat for this long. The heartbeat lets any API task sharing the database fail an
+# orphaned investigation without disturbing another live task's in-flight work.
+HEARTBEAT_INTERVAL_SECONDS = 10.0
+STALE_AFTER_SECONDS = 45.0
+
+
 class InvestigationManager:
     """Runs investigations in FastAPI background tasks and persists progress."""
 
     def __init__(self, store: InvestigationStore | None = None) -> None:
         self.store = store or InvestigationStore(os.getenv("INVESTIGATION_DB", "data/investigations.sqlite3"))
+        self.owner_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._active: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self._heartbeat_thread: threading.Thread | None = None
+        self.reconcile_stale()
 
     def start(self, incident: Incident, background_tasks: BackgroundTasks) -> None:
         cancel_event = threading.Event()
         with self._lock:
             self._active[incident.incident_id] = cancel_event
         try:
-            self.store.save(Investigation(incident=incident))
+            self.store.save(Investigation(incident=incident), owner_id=self.owner_id)
+            self._start_heartbeat()
             background_tasks.add_task(self._run, incident, cancel_event)
             logger.info(
                 "Investigation accepted",
@@ -112,6 +125,85 @@ class InvestigationManager:
     def active_count(self) -> int:
         with self._lock:
             return len(self._active)
+
+    def _start_heartbeat(self) -> None:
+        """Keep one daemon heartbeat running while this process owns active investigations."""
+        with self._lock:
+            if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+                return
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                name="investigation-heartbeat",
+                daemon=True,
+            )
+            self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while True:
+            with self._lock:
+                active_ids = list(self._active)
+                if not active_ids:
+                    self._heartbeat_thread = None
+                    return
+            try:
+                self.store.touch_heartbeat(active_ids, self.owner_id)
+                self.reconcile_stale()
+            except Exception:
+                logger.warning("Investigation heartbeat update failed", exc_info=True)
+            time.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+    def reconcile_stale(self) -> list[str]:
+        """Fail investigations whose owning API process stopped updating its heartbeat.
+
+        Heartbeats make this safe when several API tasks share one database: an investigation owned by
+        another live process keeps a fresh heartbeat and is left untouched, while work abandoned by a
+        stopped process (restart, crash, or replaced task) is closed out as failed.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=STALE_AFTER_SECONDS)).isoformat()
+        try:
+            rows = self.store.stale_running(cutoff, owner_id=self.owner_id)
+        except Exception:
+            logger.warning("Could not read stale investigations", exc_info=True)
+            return []
+        reconciled: list[str] = []
+        for row in rows:
+            investigation_id = str(row["investigation_id"])
+            with self._lock:
+                is_active_here = investigation_id in self._active
+            if is_active_here:
+                continue
+            try:
+                payload = self.store.load_payload(investigation_id)
+                if payload is None:
+                    continue
+                payload["status"] = InvestigationStatus.FAILED.value
+                payload["conclusion"] = "Investigation was interrupted before a final result was produced."
+                payload.setdefault("trajectory", []).append({
+                    "kind": "investigation_reconciled",
+                    "message": "Investigation was marked failed after its API process stopped updating the heartbeat",
+                    "details": {"previous_owner": row.get("owner_id"), "heartbeat_at": row.get("heartbeat_at")},
+                })
+                if not isinstance(payload.get("report"), dict):
+                    payload["report"] = {
+                        "investigation_id": investigation_id,
+                        "status": InvestigationStatus.FAILED.value,
+                        "incident_summary": (payload.get("incident") or {}).get("description", ""),
+                        "probable_root_cause": None,
+                        "uncertainty": [
+                            "The API process that owned this investigation stopped updating its heartbeat, "
+                            "so no final report was produced."
+                        ],
+                    }
+                self.store.save_payload(investigation_id, payload)
+            except Exception:
+                logger.warning("Could not reconcile investigation %s", investigation_id, exc_info=True)
+                continue
+            reconciled.append(investigation_id)
+            logger.info(
+                "Investigation reconciled as failed",
+                extra={"event": "investigation_reconciled", "investigation_id": investigation_id, "status": InvestigationStatus.FAILED.value},
+            )
+        return reconciled
 
     def _run(self, incident: Incident, cancel_event: threading.Event) -> None:
         try:
@@ -254,6 +346,7 @@ def get_investigation(investigation_id: str) -> dict:
 
 @app.get("/investigations/{investigation_id}/status", dependencies=[Depends(require_api_access)])
 def get_investigation_status(investigation_id: str) -> dict:
+    manager.reconcile_stale()
     result = manager.store.get_status(investigation_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
