@@ -9,6 +9,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import gradio as gr
+from gradio.themes import Soft
 
 from .config import load_local_environment
 
@@ -200,7 +201,7 @@ def main() -> None:
     app.launch(
         server_name=server_name,
         server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
-        theme=gr.themes.Soft(),
+        theme=Soft(),
         auth=(username, password) if username and password else None,
         share=False,
     )
