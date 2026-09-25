@@ -1,0 +1,99 @@
+name: Deploy to AWS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: ${{ vars.AWS_STACK_NAME }}
+      VPC_ID: ${{ vars.AWS_VPC_ID }}
+      PUBLIC_SUBNET_IDS: ${{ vars.AWS_PUBLIC_SUBNET_IDS }}
+      CERTIFICATE_ARN: ${{ vars.AWS_DASHBOARD_CERTIFICATE_ARN }}
+      DASHBOARD_DOMAIN: ${{ vars.AWS_DASHBOARD_DOMAIN }}
+      API_TOKEN_SECRET_ARN: ${{ vars.AWS_API_TOKEN_SECRET_ARN }}
+      DASHBOARD_PASSWORD_SECRET_ARN: ${{ vars.AWS_DASHBOARD_PASSWORD_SECRET_ARN }}
+      NVIDIA_API_KEY_SECRET_ARN: ${{ vars.AWS_NVIDIA_API_KEY_SECRET_ARN }}
+      DASHBOARD_USERNAME: ${{ vars.AWS_DASHBOARD_USERNAME }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Validate infrastructure template
+        run: aws cloudformation validate-template --template-body file://infra/aws/stack.yaml
+      - name: Create infrastructure on first deployment
+        shell: bash
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            aws cloudformation deploy \
+              --template-file infra/aws/stack.yaml \
+              --stack-name "$STACK_NAME" \
+              --capabilities CAPABILITY_IAM \
+              --parameter-overrides \
+                VpcId="$VPC_ID" \
+                PublicSubnetIds="$PUBLIC_SUBNET_IDS" \
+                DashboardCertificateArn="$CERTIFICATE_ARN" \
+                DashboardDomainName="$DASHBOARD_DOMAIN" \
+                ApiTokenSecretArn="$API_TOKEN_SECRET_ARN" \
+                DashboardPasswordSecretArn="$DASHBOARD_PASSWORD_SECRET_ARN" \
+                NvidiaApiKeySecretArn="$NVIDIA_API_KEY_SECRET_ARN" \
+                DashboardUsername="${DASHBOARD_USERNAME:-admin}" \
+                ImageTag=bootstrap \
+                DesiredCount=0
+          fi
+      - name: Build and publish immutable image
+        id: publish
+        shell: bash
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REPOSITORY_URI="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue | [0]" --output text)"
+          IMAGE_TAG="${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          docker build --tag "${REPOSITORY_URI}:${IMAGE_TAG}" .
+          docker push "${REPOSITORY_URI}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+      - name: Deploy image
+        shell: bash
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/aws/stack.yaml \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides \
+              VpcId="$VPC_ID" \
+              PublicSubnetIds="$PUBLIC_SUBNET_IDS" \
+              DashboardCertificateArn="$CERTIFICATE_ARN" \
+              DashboardDomainName="$DASHBOARD_DOMAIN" \
+              ApiTokenSecretArn="$API_TOKEN_SECRET_ARN" \
+              DashboardPasswordSecretArn="$DASHBOARD_PASSWORD_SECRET_ARN" \
+              NvidiaApiKeySecretArn="$NVIDIA_API_KEY_SECRET_ARN" \
+              DashboardUsername="${DASHBOARD_USERNAME:-admin}" \
+              ImageTag="${{ steps.publish.outputs.image_tag }}" \
+              DesiredCount=1
+      - name: Verify deployment health
+        shell: bash
+        run: |
+          DASHBOARD_URL="https://${DASHBOARD_DOMAIN}/"
+          DASHBOARD_PASSWORD="$(aws secretsmanager get-secret-value --secret-id "$DASHBOARD_PASSWORD_SECRET_ARN" --query SecretString --output text)"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --output /dev/null --user "${DASHBOARD_USERNAME:-admin}:${DASHBOARD_PASSWORD}" "$DASHBOARD_URL"; then
+              unset DASHBOARD_PASSWORD
+              echo "Dashboard is responding at ${DASHBOARD_URL}"
+              exit 0
+            fi
+            sleep 10
+          done
+          unset DASHBOARD_PASSWORD
+          echo "Dashboard health check failed: ${DASHBOARD_URL}" >&2
+          exit 1

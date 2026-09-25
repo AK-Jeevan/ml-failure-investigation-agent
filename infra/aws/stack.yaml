@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Single-task, authenticated MLOps investigation demo on ECS Fargate.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two public subnets in different Availability Zones for the load balancer.
+  DashboardCertificateArn:
+    Type: String
+    Description: ACM certificate ARN for the dashboard hostname, in the same region.
+  DashboardDomainName:
+    Type: String
+    Description: DNS name covered by the certificate; point it at the load balancer after deployment.
+  ApiTokenSecretArn:
+    Type: String
+    Description: Secrets Manager ARN containing the API bearer token as SecretString.
+  DashboardPasswordSecretArn:
+    Type: String
+    Description: Secrets Manager ARN containing the Gradio dashboard password as SecretString.
+  NvidiaApiKeySecretArn:
+    Type: String
+    Default: ""
+    Description: Optional Secrets Manager ARN containing the NVIDIA API key.
+  DashboardUsername:
+    Type: String
+    Default: admin
+    MinLength: 1
+  ImageTag:
+    Type: String
+    MinLength: 1
+    Description: Unique image tag required because the ECR repository is immutable.
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1
+    Description: Keep at zero for the first stack create, push the image to ECR, then update to one.
+
+Conditions:
+  HasNvidiaApiKey: !Not [!Equals [!Ref NvidiaApiKeySecretArn, ""]]
+
+Resources:
+  ContainerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Keep the latest 10 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}
+      RetentionInDays: 30
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS ingress to the investigation dashboard.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 7860
+          ToPort: 7860
+          DestinationSecurityGroupId: !GetAtt TaskSecurityGroup.GroupId
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application task ingress only from the load balancer.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 7860
+          ToPort: 7860
+          SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+
+  FileSystemSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NFS ingress only from the ECS task.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt TaskSecurityGroup.GroupId
+
+  InvestigationFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+
+  FileSystemAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref InvestigationFileSystem
+      PosixUser:
+        Uid: "10001"
+        Gid: "10001"
+      RootDirectory:
+        Path: /investigations
+        CreationInfo:
+          OwnerUid: "10001"
+          OwnerGid: "10001"
+          Permissions: "0750"
+
+  FileSystemMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref InvestigationFileSystem
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      SecurityGroups: [!GetAtt FileSystemSecurityGroup.GroupId]
+
+  FileSystemMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref InvestigationFileSystem
+      SubnetId: !Select [1, !Ref PublicSubnetIds]
+      SecurityGroups: [!GetAtt FileSystemSecurityGroup.GroupId]
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadConfiguredSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref ApiTokenSecretArn
+                  - !Ref DashboardPasswordSecretArn
+                  - !If [HasNvidiaApiKey, !Ref NvidiaApiKeySecretArn, !Ref AWS::NoValue]
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MountInvestigationEfs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: !GetAtt InvestigationFileSystem.Arn
+                Condition:
+                  StringEquals:
+                    elasticfilesystem:AccessPointArn: !GetAtt FileSystemAccessPoint.Arn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - FileSystemMountTargetA
+      - FileSystemMountTargetB
+    Properties:
+      Family: !Sub ${AWS::StackName}-investigator
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: investigation-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref InvestigationFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref FileSystemAccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: simulator
+          Image: !Sub ${ContainerRepository.RepositoryUri}:${ImageTag}
+          Essential: true
+          Command: [uvicorn, mlops_investigator.simulation_api:app, --host, 0.0.0.0, --port, "8001"]
+          Environment:
+            - {Name: SIMULATION_SCENARIO, Value: healthy}
+          PortMappings: [{ContainerPort: 8001, Protocol: tcp}]
+          MountPoints: [{SourceVolume: investigation-data, ContainerPath: /app/data, ReadOnly: false}]
+          HealthCheck:
+            Command: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: simulator
+        - Name: api
+          Image: !Sub ${ContainerRepository.RepositoryUri}:${ImageTag}
+          Essential: true
+          Command: [uvicorn, mlops_investigator.api:app, --host, 0.0.0.0, --port, "8000"]
+          Environment:
+            - {Name: INVESTIGATION_DB, Value: /app/data/investigations.sqlite3}
+            - {Name: SIMULATION_API_URL, Value: http://127.0.0.1:8001}
+            - {Name: SIMULATION_SCENARIO, Value: healthy}
+            - {Name: NVIDIA_MODEL, Value: z-ai/glm-5.3}
+            - {Name: NVIDIA_PROVIDER_ENABLED, Value: "true"}
+          Secrets:
+            - Name: API_ACCESS_TOKEN
+              ValueFrom: !Ref ApiTokenSecretArn
+            - !If
+              - HasNvidiaApiKey
+              - {Name: NVIDIA_API_KEY, ValueFrom: !Ref NvidiaApiKeySecretArn}
+              - !Ref AWS::NoValue
+          PortMappings: [{ContainerPort: 8000, Protocol: tcp}]
+          MountPoints: [{SourceVolume: investigation-data, ContainerPath: /app/data, ReadOnly: false}]
+          DependsOn: [{ContainerName: simulator, Condition: HEALTHY}]
+          HealthCheck:
+            Command: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+        - Name: dashboard
+          Image: !Sub ${ContainerRepository.RepositoryUri}:${ImageTag}
+          Essential: true
+          Command: [mlops-dashboard]
+          Environment:
+            - {Name: AGENT_API_URL, Value: http://127.0.0.1:8000}
+            - {Name: GRADIO_SERVER_NAME, Value: 0.0.0.0}
+            - {Name: GRADIO_SERVER_PORT, Value: "7860"}
+            - {Name: GRADIO_AUTH_USERNAME, Value: !Ref DashboardUsername}
+          Secrets:
+            - Name: API_ACCESS_TOKEN
+              ValueFrom: !Ref ApiTokenSecretArn
+            - Name: GRADIO_AUTH_PASSWORD
+              ValueFrom: !Ref DashboardPasswordSecretArn
+          PortMappings: [{ContainerPort: 7860, Protocol: tcp}]
+          DependsOn: [{ContainerName: api, Condition: HEALTHY}]
+          HealthCheck:
+            Command: [CMD, python, -c, "import socket; socket.create_connection(('127.0.0.1', 7860), timeout=3).close()"]
+            Interval: 30
+            Timeout: 6
+            Retries: 3
+            StartPeriod: 40
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: dashboard
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!GetAtt LoadBalancerSecurityGroup.GroupId]
+
+  DashboardTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Protocol: HTTP
+      Port: 7860
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200-399,401
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref DashboardCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DashboardTargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: false
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups: [!GetAtt TaskSecurityGroup.GroupId]
+      LoadBalancers:
+        - ContainerName: dashboard
+          ContainerPort: 7860
+          TargetGroupArn: !Ref DashboardTargetGroup
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub https://${DashboardDomainName}
+  EcrRepositoryUri:
+    Value: !GetAtt ContainerRepository.RepositoryUri
+  EcsClusterName:
+    Value: !Ref Cluster
+  EcsServiceName:
+    Value: !GetAtt Service.Name
+  LogGroupName:
+    Value: !Ref LogGroup

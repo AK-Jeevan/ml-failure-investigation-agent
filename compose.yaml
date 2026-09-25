@@ -1,0 +1,71 @@
+name: mlops-investigation-assistant
+
+services:
+  simulator:
+    build: .
+    command: ["uvicorn", "mlops_investigator.simulation_api:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      SIMULATION_SCENARIO: ${SIMULATION_SCENARIO:-feature_schema_change}
+    volumes:
+      - investigation-data:/app/data
+    expose:
+      - "8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment:
+      INVESTIGATION_DB: /app/data/investigations.sqlite3
+      API_ACCESS_TOKEN: "${API_ACCESS_TOKEN:?Set API_ACCESS_TOKEN in your environment or project .env file}"
+      SIMULATION_API_URL: http://simulator:8001
+      SIMULATION_SCENARIO: ${SIMULATION_SCENARIO:-feature_schema_change}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-z-ai/glm-5.3}
+      NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      NVIDIA_PROVIDER_ENABLED: ${NVIDIA_PROVIDER_ENABLED:-true}
+    volumes:
+      - investigation-data:/app/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      simulator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: ["mlops-dashboard"]
+    environment:
+      AGENT_API_URL: http://api:8000
+      API_ACCESS_TOKEN: "${API_ACCESS_TOKEN:?Set API_ACCESS_TOKEN in your environment or project .env file}"
+      GRADIO_AUTH_USERNAME: ${GRADIO_AUTH_USERNAME:-admin}
+      GRADIO_AUTH_PASSWORD: "${GRADIO_AUTH_PASSWORD:?Set GRADIO_AUTH_PASSWORD in your environment or project .env file}"
+      GRADIO_SERVER_NAME: 0.0.0.0
+      GRADIO_SERVER_PORT: 7860
+    ports:
+      - "127.0.0.1:7860:7860"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/', timeout=5)"]
+      interval: 30s
+      timeout: 6s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  investigation-data:

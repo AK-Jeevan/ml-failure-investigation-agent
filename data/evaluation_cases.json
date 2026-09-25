@@ -1,0 +1,37 @@
+{
+  "version": "1.0",
+  "cases": [
+    {
+      "case_id": "feature-schema-regression",
+      "scenario": "feature_schema_change",
+      "incident": "Prediction quality dropped after a feature transformation deployment.",
+      "expected_cause": "feature_change",
+      "required_evidence_sources": ["feature_statistics", "deployment_history"],
+      "approval_required": true
+    },
+    {
+      "case_id": "unexpected-input-drift",
+      "scenario": "data_drift",
+      "incident": "Prediction quality dropped while the serving model version remained stable.",
+      "expected_cause": "data_drift",
+      "required_evidence_sources": ["data_drift", "service_metrics"],
+      "approval_required": false
+    },
+    {
+      "case_id": "api-runtime-regression",
+      "scenario": "api_regression",
+      "incident": "The inference API has elevated errors and latency.",
+      "expected_cause": "api_regression",
+      "required_evidence_sources": ["api_health", "service_metrics"],
+      "approval_required": true
+    },
+    {
+      "case_id": "healthy-no-false-cause",
+      "scenario": "healthy",
+      "incident": "Check whether the reported production issue has supporting evidence.",
+      "expected_cause": null,
+      "required_evidence_sources": ["service_metrics", "feature_statistics", "api_health"],
+      "approval_required": false
+    }
+  ]
+}

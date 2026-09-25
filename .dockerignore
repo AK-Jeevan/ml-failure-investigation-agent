@@ -1,0 +1,17 @@
+.git
+.gitignore
+.codex
+.vscode
+.env
+.env.*
+Agent2
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+data/*.sqlite3
+data/simulation_state.json
