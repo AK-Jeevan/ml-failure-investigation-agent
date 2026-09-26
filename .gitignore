@@ -17,3 +17,6 @@ Agent2/
 .pytest_cache/
 build/
 dist/
+
+.vscode/
+pyrightconfig.json
