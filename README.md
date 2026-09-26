@@ -15,7 +15,7 @@
 
 Modern machine learning platforms suffer from subtle, multi-dimensional degradations: feature schema mismatch, silent data drift, upstream pipeline stalls, and API runtime regressions. Traditional monitoring alerts on symptoms but leaves on-call engineers sifting through disparate dashboards, logs, and telemetry.
 
-The **MLOps Failure Investigation Agent** automates incident triage through a strictly bounded, read-only diagnostic loop backed by deterministic hypothesis corroboration and optional LLM reasoning (**NVIDIA GLM-5.3**). Crucially, the agent adheres to enterprise security standards: **it never executes unreviewed actions on production infrastructure**. Instead, it generates advisory remediation plans, enforces cryptographic reviewer sign-off, and validates recovery through closed-loop verification.
+The **MLOps Failure Investigation Agent** automates incident triage through a strictly bounded, read-only diagnostic loop backed by deterministic hypothesis corroboration and optional LLM reasoning (**NVIDIA GLM-5.3**). Crucially, the agent adheres to enterprise security standards: **it never executes unreviewed actions on production infrastructure**. Instead, it generates advisory remediation plans, enforces auditable reviewer sign-off, and validates recovery through closed-loop verification.
 
 ### 🌟 Key Performance & Engineering Highlights
 - **100% Deterministic Pass Rate (38/38 checks)** across functional scenarios, adversarial red-team injection probes, and production compatibility suites.
@@ -33,7 +33,7 @@ The system is architected around microservices designed to run either as isolate
 graph TB
     subgraph "Clients & Presentation Layer"
         User[MLOps Engineer / SRE]
-        UI[Gradio UI :7860<br/>Basic Auth + TLS]
+        UI["Gradio UI :7860<br/>Basic Auth + TLS"]
         API_Client[CI/CD & Alert Webhook]
     end
 
@@ -42,25 +42,25 @@ graph TB
         Engine[Investigation Engine & State Machine]
         Hypo[Hypothesis Corroboration Engine]
         StopPol[Deterministic Stop Policy]
-        LLM[NVIDIA GLM-5.3 Reasoning Provider<br/>(Air-gapped Fallback: DisabledProvider)]
-        Store[(SQLite Database & Audit Trajectory)]
+        LLM["NVIDIA GLM-5.3 Reasoning Provider<br/>(Air-gapped Fallback: DisabledProvider)"]
+        Store[("SQLite Database & Audit Trajectory")]
         Remed[Human-in-the-Loop Remediation Gate]
         Verif[Closed-Loop Verification Engine]
     end
 
     subgraph "Read-Only Observability & Telemetry Adapters"
         ToolReg[Read-Only Tool Registry]
-        T1[Service Metrics: Latency, Error Rate, Quality]
-        T2[Feature Statistics: Null Rates, Schema Diffs]
-        T3[Data Drift: PSI & Jensen-Shannon Distance]
-        T4[Pipeline Status: Freshness, Dag Failures]
-        T5[Deployment History: Commits, Model Registry]
-        T6[API Health: HTTP Probes & Runtime Exceptions]
+        T1["Service Metrics: Latency, Error Rate, Quality"]
+        T2["Feature Statistics: Null Rates, Schema Diffs"]
+        T3["Data Drift: PSI & Jensen-Shannon Distance"]
+        T4["Pipeline Status: Freshness, Dag Failures"]
+        T5["Deployment History: Commits, Model Registry"]
+        T6["API Health: HTTP Probes & Runtime Exceptions"]
     end
 
     subgraph "Simulated Environment / Target Cluster (:8001)"
         SimAPI[Simulation API]
-        SimData[Scenarios: Schema Change, Drift, Regression, Healthy]
+        SimData["Scenarios: Schema Change, Drift, Regression, Healthy"]
     end
 
     User -->|HTTPS| UI
@@ -240,8 +240,8 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 # Install dependencies in editable mode
 pip install -e .
 
-# Run unit tests
-python -m unittest tests/test_investigator.py
+# Run the full 38-check evaluation suite
+mlops-investigate --evaluate
 
 # Run an investigation via CLI
 mlops-investigate --scenario feature_schema_change --incident "Payment service fraud score drop"
@@ -251,18 +251,18 @@ mlops-investigate --scenario feature_schema_change --incident "Payment service f
 
 ### Option 3: Production AWS Deployment (ECS Fargate + CloudFormation)
 
-Production infrastructure is defined as code in `infra/aws/stack.yaml` and deployed via `.github/workflows/deploy-aws.yml`. See [Deployment Guide](scripts/DEPLOYMENT.md) for full AWS setup instructions.
+Production infrastructure is defined as code in `infra/aws/stack.yaml` and deployed via `.github/workflows/deploy-aws.yml`. See [Deployment Guide](scripts/README.md) for full AWS setup instructions.
 
 ```mermaid
 graph LR
     subgraph "AWS Production Cloud Infrastructure"
-        ALB[Application Load Balancer<br/>HTTPS :443 + ACM Cert]
+        ALB["Application Load Balancer<br/>HTTPS :443 + ACM Cert"]
         subgraph "VPC Public Subnets"
-            Fargate[ECS Fargate Task<br/>Simulator + Agent API + UI]
+            Fargate["ECS Fargate Task<br/>Simulator + Agent API + UI"]
         end
-        SM[AWS Secrets Manager<br/>Bearer Tokens & API Keys]
-        EFS[(AWS EFS Encrypted<br/>Investigation Database)]
-        ECR[AWS ECR<br/>Immutable Image Repo]
+        SM["AWS Secrets Manager<br/>Bearer Tokens & API Keys"]
+        EFS[("AWS EFS Encrypted<br/>Investigation Database")]
+        ECR["AWS ECR<br/>Immutable Image Repo"]
     end
 
     Internet((Client Traffic)) -->|HTTPS| ALB
@@ -288,7 +288,7 @@ graph LR
 ├── infra/aws/
 │   └── stack.yaml                  # Production AWS CloudFormation infrastructure template
 ├── scripts/
-│   ├── DEPLOYMENT.md               # Detailed AWS, EC2 & Compose deployment guide
+│   ├── README.md                   # Detailed AWS, EC2 & Compose deployment guide
 │   ├── deploy-ec2.ps1              # Single-instance EC2 demo provisioning script
 │   └── provision-ec2.sh            # Automated Docker Engine host configuration
 ├── src/mlops_investigator/
@@ -310,11 +310,38 @@ graph LR
 │   ├── storage.py                  # SQLite persistence & audit trajectory manager
 │   ├── tools.py                    # Read-only observability tool registry
 │   └── verification.py             # Closed-loop recovery verification engine
+├── .dockerignore                   # Docker build exclusions
+├── .env.example                    # Template environment variables (safe to commit)
+├── .gitattributes                  # LF line-ending normalizer for container scripts
+├── .gitignore                      # Git tracking exclusions
 ├── compose.yaml                    # Multi-container local orchestration
 ├── Dockerfile                      # Multi-stage secure container build
+├── LICENSE                         # MIT License file
 ├── pyproject.toml                  # Python package specification
-└── README.md                       # Main documentation
+└── README.md                       # Main documentation & architectural overview
 ```
+
+---
+
+## 🔮 Future Improvements & Roadmap
+
+To expand from diagnostic triage to a multi-modal, enterprise-wide observability platform, the following architectural enhancements are planned:
+
+### 1. Multi-Modal Incident Artifacts (Visualizations & Schemas)
+- **Distribution & Drift Visualizations**: Auto-generate feature density distribution plots, Population Stability Index (PSI) binned histograms, and ROC/PR curve drift comparisons embedded directly into markdown reports and Gradio UI views.
+- **Confusion & Calibration Heatmaps**: Render visual model calibration curves and slice-level performance heatmaps when diagnosing data drift.
+- **Visual Log Inspection**: Support rendering time-series spectrograms or log-burst event charts for runtime regression analysis.
+
+### 2. Multi-File Incident Ingestion & External Log Bundles
+- **Log Archive & Crash Dump Ingestion**: Enable on-call engineers to upload diagnostic zip bundles (`tar.gz`/`zip`), containing raw training/serving log files, Kubernetes pod crash dumps (`kubectl describe pod`), and Prometheus scrape metrics.
+- **Dataset Contract Diff Tool**: Native file-to-file schema comparison supporting parquet file metadata, Apache Arrow schema files, Great Expectations suites, and Protobuf/JSON-Schema contracts.
+
+### 3. OpenTelemetry & Cloud-Native Observability Connectors
+- **Live Observability Adapters**: Replace simulation endpoints with real-time read-only adapters for **Datadog**, **Prometheus/Grafana**, **AWS CloudWatch**, and **Arize/Evidently AI**.
+- **Model Registry Hooks**: Out-of-the-box integration with MLflow, Weights & Biases, and AWS SageMaker Model Registry to automatically fetch lineage diffs between deployment revisions.
+
+### 4. Cryptographic Proof of Audit & Sign-Off (Ed25519 / Sigstore)
+- **Cryptographic Approval Signatures**: Upgrade the current auditable reviewer gate to Ed25519 asymmetric key signatures or Cosign/Sigstore attestation tokens, ensuring non-repudiation of production remediation sign-offs.
 
 ---
 
